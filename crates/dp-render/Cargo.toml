@@ -1,0 +1,18 @@
+[package]
+name = "dp-render"
+description = "wgpu rendering for DrawPaint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+dp-brush.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+dp-io.workspace = true
+pollster.workspace = true

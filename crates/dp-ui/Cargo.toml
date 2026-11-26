@@ -1,0 +1,13 @@
+[package]
+name = "dp-ui"
+description = "egui user interface for DrawPaint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+egui.workspace = true
+dp-brush.workspace = true
+dp-input.workspace = true

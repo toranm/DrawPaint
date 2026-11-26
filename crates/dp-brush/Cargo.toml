@@ -1,0 +1,11 @@
+[package]
+name = "dp-brush"
+description = "Brush engine: pointer samples to dabs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam.workspace = true

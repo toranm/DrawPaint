@@ -1,0 +1,25 @@
+[package]
+name = "drawpaint"
+description = "Open source digital painting app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+dp-brush.workspace = true
+dp-core.workspace = true
+dp-input.workspace = true
+dp-render.workspace = true
+dp-ui.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+glam.workspace = true
+pollster.workspace = true
+tracing = "0.1"
+tracing-subscriber = "0.3"
+wgpu.workspace = true
+winit.workspace = true

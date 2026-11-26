@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/toranm/DrawPaint"
+rust-version = "1.97"
+
+[workspace.dependencies]
+dp-core = { path = "crates/dp-core" }
+dp-brush = { path = "crates/dp-brush" }
+dp-render = { path = "crates/dp-render" }
+dp-io = { path = "crates/dp-io" }
+dp-input = { path = "crates/dp-input" }
+dp-ui = { path = "crates/dp-ui" }
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = "0.37"
+egui-winit = "0.37"
+glam = { version = "0.34", features = ["bytemuck"] }
+pollster = "1"
+wgpu = "30"
+winit = "0.30"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

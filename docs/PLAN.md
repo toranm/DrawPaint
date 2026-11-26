@@ -188,8 +188,7 @@ struct PointerSample {
 Cada fase termina con una versión ejecutable en Windows y etiquetada.
 
 ### Fase 0 — Cimientos y pruebas de concepto
-- Workspace, licencia, README, CONTRIBUTING.
-- Registrar el runner self-hosted de Windows y CI (fmt, clippy, tests) sobre él; ver 6.1.
+- Workspace, licencia, README, CONTRIBUTING, CI (fmt, clippy, tests); ver 6.1.
 - Ventana winit + wgpu + egui mostrando una textura con mover/zoom/rotar.
 - **Spike R1**: backend WM_POINTER con presión, inclinación, borrador e historial de puntos. Probar con al menos una tableta Wacom/Huion y un dispositivo con pantalla y lápiz.
 - **Spike R2**: medir latencia de presentación (vsync vs. mailbox) y coste de rasterizar dabs grandes.
@@ -250,43 +249,23 @@ Cada fase termina con una versión ejecutable en Windows y etiquetada.
 - CI: `cargo fmt --check`, `clippy -D warnings`, tests, `cargo-deny` (licencias y avisos de seguridad).
 - `unsafe` solo en `dp-input` (FFI de Windows) y revisado.
 
-### 6.1 CI con runner self-hosted
+### 6.1 CI
 
-La CI corre en GitHub Actions sobre un runner propio, no sobre los runners alojados por GitHub.
+El repositorio es público, así que la CI usa los runners alojados por GitHub (`windows-latest` y `ubuntu-latest`), que no consumen créditos en repos públicos. En cada push y pull request:
 
-**Montaje**
+- **Windows**: formato, clippy, tests y compilación en release; el `drawpaint.exe` resultante se publica como artefacto de la ejecución.
+- **Linux**: clippy y tests, con Vulkan por software (`mesa-vulkan-drivers`) para los tests de render.
 
-- Runner de Windows x64 registrado a nivel de repositorio, con etiquetas `self-hosted, windows, x64`. Los workflows usan `runs-on: [self-hosted, windows, x64]`.
-- Instalado como servicio de Windows bajo un **usuario local dedicado sin permisos de administrador**, idealmente dentro de una VM (Hyper-V) para aislarlo del equipo personal.
-- Herramientas preinstaladas en el runner: `rustup` (toolchain fijada con `rust-toolchain.toml`), MSVC Build Tools, Git, `cargo-deny`, `cargo-nextest`, y WiX cuando llegue el instalador.
-- Runner de Linux (fase 5): un segundo runner en WSL2 o en una VM en la misma máquina, con etiquetas `self-hosted, linux, x64`.
+Los tests de render exigen un adaptador gráfico en CI (`DP_REQUIRE_GPU=1`): WARP en Windows, lavapipe en Linux.
 
-**Ventajas que aprovechamos**
-
-- El directorio `target/` persiste entre ejecuciones: compilaciones incrementales sin subir ni bajar cachés.
-- Si el runner tiene GPU, los tests de imagen dorada pueden correr también sobre hardware real además de WARP.
-
-**Seguridad (repositorio público)**
-
-Un runner self-hosted ejecuta el código del workflow en nuestra máquina; en un repo público, un pull request de un fork podría ejecutar código arbitrario en ella. Reglas:
-
-- En *Settings → Actions → General*: exigir aprobación manual para los workflows de **todos** los colaboradores externos.
-- Los workflows se disparan con `push` a `main` y con `pull_request` (nunca `pull_request_target`), con `permissions: contents: read` por defecto.
-- Ningún secreto disponible en los jobs de PR; los secretos de publicación solo en el workflow de release, que se dispara por etiqueta.
-- Limpieza del workspace al inicio de cada job (`git clean -ffdx` excepto `target/`).
-- Revisar el diff de `.github/workflows/` y de `build.rs` antes de aprobar la ejecución de un PR externo.
-
-**Limitaciones**
-
-- Si la máquina está apagada, los jobs quedan en cola (GitHub los cancela pasadas 24 h). La CI no bloquea el merge del mantenedor cuando el runner no está disponible.
-- Un solo runner = un job a la vez: el pipeline se organiza como un único job secuencial (fmt → clippy → tests → deny) en lugar de una matriz.
+**Runner self-hosted (opcional).** Solo compensa si hace falta una GPU real en CI o si el repo vuelve a ser privado. En ese caso: runner de Windows como servicio bajo un usuario local sin permisos de administrador (idealmente en una VM), aprobación manual de workflows para colaboradores externos, ningún secreto en jobs de PR y nunca `pull_request_target`. En un repo público, un PR de un fork puede ejecutar código arbitrario en la máquina del runner.
 
 ---
 
 ## 7. Distribución
 
 - Windows 10 1809+ y Windows 11, x86_64 (ARM64 más adelante).
-- Releases en GitHub generadas por la CI (runner self-hosted) al empujar una etiqueta: instalador MSI (`cargo-wix` o `cargo-dist`) y zip portable; después `winget` y Scoop.
+- Releases en GitHub generadas por la CI al empujar una etiqueta: instalador MSI (`cargo-wix` o `cargo-dist`) y zip portable; después `winget` y Scoop.
 - Firma de código: sin certificado al principio (aviso de SmartScreen); evaluar SignPath para proyectos open source.
 - Configuración en `%APPDATA%\DrawPaint`, proyectos en `Documentos\DrawPaint`; modo portable si existe `portable.txt` junto al ejecutable.
 - Linux: AppImage y Flatpak (fase 5).
@@ -310,13 +289,27 @@ Un runner self-hosted ejecuta el código del workflow en nuestra máquina; en un
 
 ## 9. Decisiones pendientes
 
-1. **Licencia.** Recomendación: `GPL-3.0-or-later`, que protege la app de forks cerrados (es lo habitual en apps de usuario final como Krita). Alternativa: `MIT OR Apache-2.0`, más permisiva y estándar en bibliotecas Rust. Hay que decidirlo antes del primer commit de código.
+1. ~~Licencia~~ — decidido: `GPL-3.0-or-later`.
 2. **Nombre definitivo.** "DrawPaint" es el nombre de trabajo; conviene comprobar que no choca con marcas existentes.
 3. **Hardware de prueba.** Qué tableta(s) y dispositivos hay disponibles para el spike de entrada.
 4. **Idioma del código y la documentación.** Recomendación: código y comentarios en inglés, documentación de usuario en español e inglés.
 
 ---
 
-## 10. Siguiente paso
+## 10. Estado
 
-Ejecutar la Fase 0: crear el workspace con los siete crates, la CI, y la ventana winit + wgpu + egui con un lienzo navegable, seguido del spike de entrada de lápiz en Windows.
+**Fase 0 — en curso.**
+
+Hecho:
+
+- Workspace con los siete crates, licencia, README, CONTRIBUTING y CI.
+- Ventana winit + wgpu + egui con lienzo navegable (zoom, rotación, desplazamiento, ajustar).
+- Pincel redondo en GPU sensible a la presión, verificado con un test que comprueba los píxeles.
+- Backend de lápiz `WM_POINTER` para Windows: presión, inclinación, borrador, historial de puntos y posición subpíxel.
+
+Pendiente para cerrar la fase (requiere hardware real con Windows):
+
+- **Spike R1**: probar el backend de lápiz con una tableta y con una pantalla con lápiz. El código compila para Windows pero aún no se ha ejecutado en un dispositivo. El panel "Puntero" muestra los datos necesarios para validarlo.
+- **Spike R2**: medir la latencia de presentación (vsync frente a mailbox) y el coste de los dabs grandes.
+
+Simplificaciones conscientes de la fase 0, que se resuelven en la fase 1: se pinta directamente sobre el lienzo (sin búfer de trazo), interpolación lineal entre muestras (sin estabilizador), el borrador pinta con el color del papel, y los bordes del lienzo rotado no están suavizados.
