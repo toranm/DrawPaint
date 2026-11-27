@@ -47,3 +47,13 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # Temporary: capture a backtrace for the crash seen in the session tests.
+      - name: Diagnose crash
+        if: failure()
+        run: |
+          sudo apt-get install -y gdb
+          dpkg -l | grep -E "mesa-vulkan|libllvm" || true
+          bin=$(find target/debug/deps -maxdepth 1 -name 'drawpaint-*' -type f -executable | head -1)
+          for attempt in 1 2 3 4 5; do
+            gdb -batch -ex run -ex "thread apply all bt 30" --args "$bin" 2>&1 | tail -120
+          done
