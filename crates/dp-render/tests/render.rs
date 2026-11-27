@@ -26,11 +26,20 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     Some(pollster::block_on(adapter.request_device(&Default::default())).expect("create device"))
 }
 
-fn setup() -> Option<(Document, CanvasRenderer)> {
+/// Software Vulkan drivers have crashed when several devices compile shaders
+/// at the same time, which only parallel tests do. GPU tests take turns.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+type GpuTurn = std::sync::MutexGuard<'static, ()>;
+
+/// The first element keeps other GPU tests waiting; hold it for the whole test.
+fn setup() -> Option<(GpuTurn, Document, CanvasRenderer)> {
+    // A test that failed while holding the lock must not fail the others.
+    let turn = GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (device, queue) = device()?;
     let document = Document::new(SIZE, SIZE).unwrap();
     let renderer = CanvasRenderer::new(&device, &queue, CANVAS_FORMAT, &document);
-    Some((document, renderer))
+    Some((turn, document, renderer))
 }
 
 fn pixel(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
@@ -82,7 +91,7 @@ fn stroke(renderer: &mut CanvasRenderer, layer: LayerId, params: BrushParams, po
 
 #[test]
 fn pressure_stroke_reaches_the_layer_and_the_composite() {
-    let Some((document, mut renderer)) = setup() else { return };
+    let Some((_turn, document, mut renderer)) = setup() else { return };
     let layer = document.active();
     let params = BrushParams { size: 40.0, min_size_ratio: 0.05, hardness: 0.9, ..Default::default() };
     stroke(&mut renderer, layer, params, &[(28.0, 128.0, 0.0), (228.0, 128.0, 1.0)]);
@@ -109,7 +118,7 @@ fn pressure_stroke_reaches_the_layer_and_the_composite() {
 
 #[test]
 fn stroke_opacity_caps_self_overlap() {
-    let Some((document, mut renderer)) = setup() else { return };
+    let Some((_turn, document, mut renderer)) = setup() else { return };
     let layer = document.active();
     let params = BrushParams {
         size: 30.0,
@@ -134,7 +143,7 @@ fn stroke_opacity_caps_self_overlap() {
 
 #[test]
 fn low_flow_builds_up_to_full_coverage() {
-    let Some((document, mut renderer)) = setup() else { return };
+    let Some((_turn, document, mut renderer)) = setup() else { return };
     let layer = document.active();
     let params = BrushParams {
         size: 40.0,
@@ -153,7 +162,7 @@ fn low_flow_builds_up_to_full_coverage() {
 
 #[test]
 fn eraser_removes_paint() {
-    let Some((document, mut renderer)) = setup() else { return };
+    let Some((_turn, document, mut renderer)) = setup() else { return };
     let layer = document.active();
     renderer.pixels().write_rect(layer, full(), &solid([255, 0, 0, 255]));
     let params = BrushParams {
@@ -175,7 +184,7 @@ fn eraser_removes_paint() {
 
 #[test]
 fn stroke_undo_and_redo_restore_pixels() {
-    let Some((mut document, mut renderer)) = setup() else { return };
+    let Some((_turn, mut document, mut renderer)) = setup() else { return };
     let layer = document.active();
     let mut history = History::new(usize::MAX);
 
@@ -202,7 +211,7 @@ fn stroke_undo_and_redo_restore_pixels() {
 
 #[test]
 fn sub_rectangle_round_trip() {
-    let Some((document, mut renderer)) = setup() else { return };
+    let Some((_turn, document, mut renderer)) = setup() else { return };
     let layer = document.active();
     // An odd width exercises the row padding of GPU copies.
     let rect = Rect::new(17, 33, 7, 5);
@@ -216,7 +225,7 @@ fn sub_rectangle_round_trip() {
 
 #[test]
 fn blend_modes_and_layer_properties() {
-    let Some((mut document, mut renderer)) = setup() else { return };
+    let Some((_turn, mut document, mut renderer)) = setup() else { return };
     let mut history = History::new(usize::MAX);
     let bottom = document.active();
     let top = document.new_layer();
@@ -255,7 +264,7 @@ fn blend_modes_and_layer_properties() {
 
 #[test]
 fn translucent_layers_composite_over_paper() {
-    let Some((document, mut renderer)) = setup() else { return };
+    let Some((_turn, document, mut renderer)) = setup() else { return };
     let layer = document.active();
     // 50 % red, premultiplied.
     renderer.pixels().write_rect(layer, full(), &solid([128, 0, 0, 128]));

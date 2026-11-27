@@ -552,9 +552,19 @@ mod tests {
 
     const CANVAS_AREA: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 600.0));
 
+    /// Software Vulkan drivers have crashed when several devices compile
+    /// shaders at the same time, which only parallel tests do. GPU tests
+    /// take turns.
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    type GpuTurn = std::sync::MutexGuard<'static, ()>;
+
     /// Returns `None` when the machine has no usable graphics adapter; with
-    /// `DP_REQUIRE_GPU=1` that is a failure instead.
-    fn session() -> Option<Session> {
+    /// `DP_REQUIRE_GPU=1` that is a failure instead. The first element keeps
+    /// other GPU tests waiting; hold it for the whole test.
+    fn session() -> Option<(GpuTurn, Session)> {
+        // A test that failed while holding the lock must not fail the others.
+        let turn = GPU.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = match pollster::block_on(instance.request_adapter(&Default::default())) {
             Ok(adapter) => adapter,
@@ -570,7 +580,7 @@ mod tests {
         session.new_document(64, 48).unwrap();
         session.view = ViewTransform::default();
         session.fit_pending = false;
-        Some(session)
+        Some((turn, session))
     }
 
     fn sample(phase: Phase, x: f32, y: f32) -> PointerSample {
@@ -617,7 +627,7 @@ mod tests {
 
     #[test]
     fn paint_layers_undo_and_redo() {
-        let Some(mut session) = session() else { return };
+        let Some((_turn, mut session)) = session() else { return };
         let mut ui = UiState::default();
         assert!(!session.modified);
 
@@ -659,7 +669,7 @@ mod tests {
 
     #[test]
     fn eraser_and_eyedropper() {
-        let Some(mut session) = session() else { return };
+        let Some((_turn, mut session)) = session() else { return };
         let mut ui = UiState::default();
         hard_brush(&mut ui, [1.0, 0.0, 0.0]);
         draw_line(&mut session, &mut ui, 20.0);
@@ -682,7 +692,7 @@ mod tests {
 
     #[test]
     fn hidden_layer_refuses_paint() {
-        let Some(mut session) = session() else { return };
+        let Some((_turn, mut session)) = session() else { return };
         let mut ui = UiState::default();
         let id = session.document.active();
         let hidden = dp_core::LayerProps { visible: false, ..session.document.active_layer().props.clone() };
@@ -700,7 +710,7 @@ mod tests {
 
     #[test]
     fn save_reopen_and_export() {
-        let Some(mut session) = session() else { return };
+        let Some((_turn, mut session)) = session() else { return };
         let mut ui = UiState::default();
         hard_brush(&mut ui, [1.0, 0.0, 0.0]);
         draw_line(&mut session, &mut ui, 12.0);
@@ -747,7 +757,7 @@ mod tests {
 
     #[test]
     fn unsaved_changes_are_guarded() {
-        let Some(mut session) = session() else { return };
+        let Some((_turn, mut session)) = session() else { return };
         let mut ui = UiState::default();
         draw_line(&mut session, &mut ui, 12.0);
 
