@@ -47,13 +47,21 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # Temporary: capture a backtrace for the crash seen in the session tests.
-      - name: Diagnose crash
-        if: failure()
+      # Temporary: the session tests crashed once with SIGSEGV and passed on
+      # the next run. Repeat them under gdb until a crash yields a backtrace.
+      - name: Hunt intermittent crash
+        if: always()
         run: |
-          sudo apt-get install -y gdb
+          sudo apt-get install -y gdb > /dev/null
           dpkg -l | grep -E "mesa-vulkan|libllvm" || true
           bin=$(find target/debug/deps -maxdepth 1 -name 'drawpaint-*' -type f -executable | head -1)
-          for attempt in 1 2 3 4 5; do
-            gdb -batch -ex run -ex "thread apply all bt 30" --args "$bin" 2>&1 | tail -120
+          for attempt in $(seq 1 40); do
+            gdb -batch -ex run -ex "thread apply all bt 30" --args "$bin" > gdb.log 2>&1 || true
+            if grep -q "SIGSEGV\|SIGABRT\|SIGBUS" gdb.log; then
+              echo "::group::crash on attempt $attempt"
+              tail -250 gdb.log
+              echo "::endgroup::"
+              exit 1
+            fi
           done
+          echo "no crash in 40 attempts"
