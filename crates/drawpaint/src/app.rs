@@ -1,14 +1,11 @@
-//! Event loop glue between the window, the UI, input and rendering.
+//! Event loop glue between the window, the UI, input and the session.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use dp_brush::{Dab, StrokeBuilder};
-use dp_core::{Document, ViewTransform};
-use dp_input::{DeviceKind, NativePen, Phase, PointerSample};
-use dp_render::{Canvas, CanvasPresenter, DabRenderer};
-use dp_ui::{Action, PointerInfo, UiState, ViewInfo};
+use dp_input::{NativePen, PointerSample};
+use dp_ui::{PointerInfo, UiState};
 use glam::{vec2, Vec2};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -19,16 +16,14 @@ use winit::window::{Window, WindowId};
 
 use crate::gpu::Gpu;
 use crate::pointer::PointerInput;
+use crate::session::Session;
 
-const DEFAULT_CANVAS_SIDE: u32 = 2048;
-/// Premultiplied colour of a new canvas, and what the eraser paints with
-/// until real transparency arrives with layers in phase 1.
-const PAPER: [f32; 4] = [1.0; 4];
 const WORKSPACE_BACKGROUND: wgpu::Color = wgpu::Color { r: 0.16, g: 0.16, b: 0.17, a: 1.0 };
 const ZOOM_PER_WHEEL_LINE: f32 = 1.15;
 const ROTATION_PER_WHEEL_LINE: f32 = std::f32::consts::PI / 36.0;
 /// Pixels of touchpad scroll treated as one wheel line.
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
+const BRUSH_SIZE_STEP: f32 = 1.15;
 
 pub fn run() -> anyhow::Result<()> {
     let event_loop = EventLoop::new().context("create event loop")?;
@@ -62,7 +57,10 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         if let Some(state) = &mut self.state {
-            state.window_event(event_loop, event);
+            state.window_event(event);
+            if state.session.exit_requested() {
+                event_loop.exit();
+            }
         }
     }
 
@@ -71,11 +69,6 @@ impl ApplicationHandler for App {
             state.about_to_wait(event_loop);
         }
     }
-}
-
-struct Stroke {
-    builder: StrokeBuilder,
-    color: [f32; 3],
 }
 
 enum Drag {
@@ -90,22 +83,15 @@ struct State {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
 
-    document: Document,
-    canvas: Canvas,
-    dabs: DabRenderer,
-    presenter: CanvasPresenter,
-    view: ViewTransform,
-    /// The view is fitted once the UI has reported the canvas area.
-    fit_pending: bool,
-    clear_pending: bool,
+    session: Session,
+    ui: UiState,
     /// Canvas area in physical pixels, from the last UI pass.
     canvas_rect: egui::Rect,
+    /// Window title last sent to the system.
+    title: String,
 
-    ui: UiState,
     pointer: PointerInput,
     samples: Vec<PointerSample>,
-    dab_scratch: Vec<Dab>,
-    stroke: Option<Stroke>,
     drag: Drag,
     modifiers: ModifiersState,
     space_held: bool,
@@ -132,12 +118,11 @@ impl State {
         let egui_renderer =
             egui_wgpu::Renderer::new(&gpu.device, gpu.config.format, egui_wgpu::RendererOptions::default());
 
-        let side = DEFAULT_CANVAS_SIDE.min(Canvas::max_side(&gpu.device));
-        let document = Document::new(side, side);
-        let canvas = Canvas::new(&gpu.device, document.width, document.height);
-        let dabs = DabRenderer::new(&gpu.device);
-        let presenter = CanvasPresenter::new(&gpu.device, gpu.config.format, &canvas);
-
+        let mut session = Session::new(&gpu.device, &gpu.queue, gpu.config.format)?;
+        // A document or image passed on the command line opens at startup.
+        if let Some(path) = std::env::args_os().nth(1) {
+            session.open_at_startup(std::path::Path::new(&path));
+        }
         let native_pen = NativePen::install(&window);
         tracing::info!(native_pen = native_pen.is_some(), "pointer input ready");
 
@@ -147,19 +132,12 @@ impl State {
             egui_ctx,
             egui_state,
             egui_renderer,
-            document,
-            canvas,
-            dabs,
-            presenter,
-            view: ViewTransform::default(),
-            fit_pending: true,
-            clear_pending: true,
-            canvas_rect: egui::Rect::NOTHING,
+            session,
             ui: UiState::default(),
+            canvas_rect: egui::Rect::NOTHING,
+            title: String::new(),
             pointer: PointerInput::new(native_pen),
             samples: Vec::new(),
-            dab_scratch: Vec::new(),
-            stroke: None,
             drag: Drag::None,
             modifiers: ModifiersState::empty(),
             space_held: false,
@@ -167,7 +145,7 @@ impl State {
         })
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+    fn window_event(&mut self, event: WindowEvent) {
         // Pen samples are captured by the native hook before winit sees the
         // message, so they are always ahead of the event handled here.
         self.pointer.poll_native(&mut self.samples);
@@ -178,7 +156,10 @@ impl State {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.session.request_close();
+                self.window.request_redraw();
+            }
             WindowEvent::Resized(size) => {
                 self.gpu.resize(size.width, size.height);
                 self.window.request_redraw();
@@ -189,14 +170,15 @@ impl State {
                 let pressed = event.state == ElementState::Pressed;
                 if event.logical_key == Key::Named(NamedKey::Space) {
                     self.space_held = pressed;
-                } else if pressed && !event.repeat && !self.egui_ctx.egui_wants_keyboard_input() {
-                    self.shortcut(&event.logical_key);
+                } else if pressed && !self.egui_ctx.egui_wants_keyboard_input() && !self.session.is_blocked()
+                {
+                    self.shortcut(&event.logical_key, event.repeat);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = vec2(position.x as f32, position.y as f32);
                 if let Drag::Pan { last } = &mut self.drag {
-                    self.view.pan(pos - *last);
+                    self.session.view.pan(pos - *last);
                     *last = pos;
                     self.window.request_redraw();
                 }
@@ -205,7 +187,8 @@ impl State {
             WindowEvent::MouseInput { button, state, .. } => {
                 let pressed = state == ElementState::Pressed;
                 let pans = button == MouseButton::Middle || (button == MouseButton::Left && self.space_held);
-                if pressed && pans && self.stroke.is_none() && self.is_over_canvas(self.pointer.cursor()) {
+                let free = !self.session.is_painting() && self.is_over_canvas(self.pointer.cursor());
+                if pressed && pans && free {
                     self.drag = Drag::Pan { last: self.pointer.cursor() };
                 } else if !pressed && matches!(self.drag, Drag::Pan { .. }) {
                     self.drag = Drag::None;
@@ -225,9 +208,9 @@ impl State {
                 let anchor = self.pointer.cursor();
                 if self.is_over_canvas(anchor) {
                     if self.modifiers.shift_key() {
-                        self.view.rotate_about(anchor, lines * ROTATION_PER_WHEEL_LINE);
+                        self.session.view.rotate_about(anchor, lines * ROTATION_PER_WHEEL_LINE);
                     } else {
-                        self.view.zoom_about(anchor, ZOOM_PER_WHEEL_LINE.powf(lines));
+                        self.session.view.zoom_about(anchor, ZOOM_PER_WHEEL_LINE.powf(lines));
                     }
                     self.window.request_redraw();
                 }
@@ -252,107 +235,79 @@ impl State {
         }
     }
 
-    fn shortcut(&mut self, key: &Key) {
-        if !self.modifiers.control_key() {
-            return;
-        }
-        match key {
-            Key::Character(c) if c == "0" => self.apply(Action::FitView),
-            Key::Character(c) if c == "1" => self.apply(Action::ActualSize),
-            _ => return,
+    fn shortcut(&mut self, key: &Key, repeat: bool) {
+        use dp_ui::Action;
+        let Key::Character(text) = key else { return };
+        let text = text.to_lowercase();
+        let (ctrl, shift) = (self.modifiers.control_key(), self.modifiers.shift_key());
+        let action = match (ctrl, shift, text.as_str()) {
+            (true, false, "z") => Some(Action::Undo),
+            (true, false, "y") | (true, true, "z") => Some(Action::Redo),
+            _ if repeat => None,
+            (true, false, "s") => Some(Action::Save),
+            (true, true, "s") => Some(Action::SaveAs),
+            (true, false, "o") => Some(Action::Open),
+            (true, false, "e") => Some(Action::Export),
+            (true, false, "0") => Some(Action::FitView),
+            (true, false, "1") => Some(Action::ActualSize),
+            (true, false, "n") => {
+                let document = self.session.document();
+                self.ui.new_canvas = Some([document.width(), document.height()]);
+                None
+            }
+            _ => None,
+        };
+        if let Some(action) = action {
+            self.session.apply(action, self.canvas_rect);
+        } else if !ctrl {
+            let presets = dp_brush::presets();
+            match text.as_str() {
+                "[" => self.ui.brush.size = (self.ui.brush.size / BRUSH_SIZE_STEP).max(1.0),
+                "]" => self.ui.brush.size = (self.ui.brush.size * BRUSH_SIZE_STEP).min(500.0),
+                "b" if !repeat => self.ui.select_preset(0),
+                "e" if !repeat => {
+                    if let Some(eraser) = presets.iter().position(|p| p.params.erase) {
+                        self.ui.select_preset(eraser);
+                    }
+                }
+                _ => return,
+            }
         }
         self.window.request_redraw();
-    }
-
-    fn canvas_center(&self) -> Vec2 {
-        let c = self.canvas_rect.center();
-        vec2(c.x, c.y)
-    }
-
-    fn apply(&mut self, action: Action) {
-        match action {
-            Action::FitView => {
-                let (min, size) = (self.canvas_rect.min, self.canvas_rect.size());
-                self.view =
-                    ViewTransform::fit(self.document.size(), vec2(min.x, min.y), vec2(size.x, size.y));
-            }
-            Action::ActualSize => self.view.set_zoom_about(self.canvas_center(), 1.0),
-            Action::ResetRotation => self.view.rotate_about(self.canvas_center(), -self.view.rotation),
-            Action::ClearCanvas => {
-                self.stroke = None;
-                self.clear_pending = true;
-            }
-        }
     }
 
     /// Whether a window position (physical pixels) is on the canvas area and
     /// not covered by a popup or other floating UI.
     fn is_over_canvas(&self, pos: Vec2) -> bool {
         let pos = egui::pos2(pos.x, pos.y);
-        if !self.canvas_rect.contains(pos) {
+        if !self.canvas_rect.contains(pos) || self.session.is_blocked() {
             return false;
         }
         let points = pos / self.egui_ctx.pixels_per_point();
         self.egui_ctx.layer_id_at(points).is_none_or(|layer| layer.order == egui::Order::Background)
     }
 
-    /// Feeds queued pointer samples to the brush engine.
+    /// Feeds queued pointer samples to the session.
     fn process_samples(&mut self) {
         if self.samples.is_empty() {
             return;
         }
         let samples = std::mem::take(&mut self.samples);
+        let panning = matches!(self.drag, Drag::Pan { .. }) || self.space_held;
         for sample in &samples {
-            let pos = self.view.to_canvas(sample.pos);
-            match sample.phase {
-                Phase::Down => {
-                    let blocked = matches!(self.drag, Drag::Pan { .. }) || self.space_held;
-                    if !blocked && self.is_over_canvas(sample.pos) {
-                        let color = match sample.device {
-                            DeviceKind::Eraser => [PAPER[0], PAPER[1], PAPER[2]],
-                            _ => self.ui.color,
-                        };
-                        let builder =
-                            StrokeBuilder::begin(self.ui.brush, pos, sample.pressure, &mut self.dab_scratch);
-                        self.stroke = Some(Stroke { builder, color });
-                    }
-                }
-                Phase::Move => {
-                    if let Some(stroke) = &mut self.stroke {
-                        stroke.builder.extend(pos, sample.pressure, &mut self.dab_scratch);
-                    }
-                }
-                Phase::Up => {
-                    // The lift-off sample carries no pressure; the stroke
-                    // ends where the last contact sample left it.
-                    self.flush_dab_scratch();
-                    self.stroke = None;
-                }
-                Phase::Hover => {}
-            }
+            let may_start = !panning && self.is_over_canvas(sample.pos);
+            let pick_color = self.modifiers.alt_key();
+            self.session.pointer(sample, may_start, pick_color, &mut self.ui);
         }
-        self.flush_dab_scratch();
         // Reuse the allocation for the next batch.
         self.samples = samples;
         self.samples.clear();
-        // The pointer readout changes with every sample.
+        // The pointer readout and brush outline change with every sample.
         self.window.request_redraw();
-    }
-
-    fn flush_dab_scratch(&mut self) {
-        if let Some(stroke) = &self.stroke {
-            self.dabs.queue(&self.dab_scratch, stroke.color);
-        }
-        self.dab_scratch.clear();
     }
 
     fn redraw(&mut self) {
         let pixels_per_point = egui_winit::pixels_per_point(&self.egui_ctx, &self.window);
-        let view_info = ViewInfo {
-            zoom: self.view.zoom,
-            rotation_degrees: self.view.rotation.to_degrees(),
-            canvas_size: [self.document.width, self.document.height],
-        };
         let last = self.pointer.last_sample();
         let pointer_info = PointerInfo {
             native_pen_backend: self.pointer.has_native_pen(),
@@ -361,22 +316,37 @@ impl State {
             tilt_degrees: last.map_or([0.0; 2], |s| s.tilt.to_array()),
             samples_per_second: self.pointer.samples_per_second(),
         };
+        let max_side = dp_render::CanvasRenderer::max_side(&self.gpu.device);
+        let cursor = self.pointer.cursor();
+        let show_outline = self.is_over_canvas(cursor) && !matches!(self.drag, Drag::Pan { .. });
 
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let mut ui_output = None;
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            ui_output = Some(dp_ui::show(ui, &mut self.ui, view_info, pointer_info));
+            let frame = self.session.frame(pointer_info, max_side);
+            ui_output = Some(dp_ui::show(ui, &mut self.ui, &frame));
+            if show_outline {
+                // Brush outline at the cursor, at its on-canvas size.
+                let radius = self.ui.brush.size * 0.5 * self.session.view.zoom / pixels_per_point;
+                let center = egui::pos2(cursor.x, cursor.y) / pixels_per_point;
+                let painter = ui.ctx().layer_painter(egui::LayerId::background());
+                painter.circle_stroke(center, radius + 1.0, (1.0, egui::Color32::from_black_alpha(160)));
+                painter.circle_stroke(center, radius, (1.0, egui::Color32::from_white_alpha(220)));
+            }
         });
         self.egui_state.handle_platform_output(&self.window, full_output.platform_output);
 
         if let Some(output) = ui_output {
             self.canvas_rect = output.canvas_rect * pixels_per_point;
-            if std::mem::take(&mut self.fit_pending) {
-                self.apply(Action::FitView);
-            }
             for action in output.actions {
-                self.apply(action);
+                self.session.apply(action, self.canvas_rect);
             }
+        }
+        self.session.fit_if_pending(self.canvas_rect);
+        let title = self.session.window_title();
+        if title != self.title {
+            self.window.set_title(&title);
+            self.title = title;
         }
 
         let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, pixels_per_point);
@@ -394,11 +364,7 @@ impl State {
         }
 
         let mut encoder = device.create_command_encoder(&Default::default());
-        if std::mem::take(&mut self.clear_pending) {
-            self.canvas.clear(&mut encoder, PAPER);
-        }
-        self.dabs.flush(device, queue, &mut encoder, &self.canvas);
-        self.presenter.set_view(queue, &self.canvas, self.view.canvas_to_screen(), self.gpu.size());
+        self.session.prepare_frame(&mut encoder, self.gpu.size());
         let egui_commands =
             self.egui_renderer.update_buffers(device, queue, &mut encoder, &paint_jobs, &screen);
 
@@ -439,11 +405,11 @@ impl State {
                     ..Default::default()
                 })
                 .forget_lifetime();
-            self.presenter.draw(&mut pass);
+            self.session.draw(&mut pass);
             self.egui_renderer.render(&mut pass, &paint_jobs, &screen);
         }
 
-        // Canvas edits are submitted even when no frame could be acquired.
+        // Canvas work is submitted even when no frame could be acquired.
         queue.submit(egui_commands.into_iter().chain([encoder.finish()]));
         if let Some(frame) = frame {
             self.window.pre_present_notify();

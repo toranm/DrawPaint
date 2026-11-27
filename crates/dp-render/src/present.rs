@@ -1,8 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Affine2, Mat4, Vec2, Vec3};
 
-use crate::Canvas;
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ViewUniform {
@@ -11,14 +9,20 @@ struct ViewUniform {
     _padding: [f32; 2],
 }
 
-/// Draws a canvas into the window through a view transform.
-pub struct CanvasPresenter {
-    pipeline: wgpu::RenderPipeline,
-    uniform: wgpu::Buffer,
+/// Bind groups for one source texture.
+struct Source {
     /// Smooth sampling for zoomed-out views.
     linear: wgpu::BindGroup,
     /// Crisp pixels for zoomed-in views.
     nearest: wgpu::BindGroup,
+}
+
+/// Draws the flattened canvas into the window through a view transform.
+pub(crate) struct CanvasPresenter {
+    pipeline: wgpu::RenderPipeline,
+    uniform: wgpu::Buffer,
+    sources: Vec<Source>,
+    canvas_size: (u32, u32),
     use_nearest: bool,
 }
 
@@ -26,7 +30,14 @@ impl CanvasPresenter {
     /// Zoom from which individual canvas pixels are shown unfiltered.
     const NEAREST_FROM_ZOOM: f32 = 2.0;
 
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, canvas: &Canvas) -> Self {
+    /// `sources` are the textures the canvas may be drawn from; one is
+    /// chosen per frame in [`CanvasPresenter::draw`].
+    pub fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        canvas_size: (u32, u32),
+        sources: &[&wgpu::TextureView],
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/present.wgsl"));
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("canvas view"),
@@ -59,7 +70,7 @@ impl CanvasPresenter {
             multiview_mask: None,
             cache: None,
         });
-        let bind_group = |filter: wgpu::FilterMode| {
+        let bind_group = |view: &wgpu::TextureView, filter: wgpu::FilterMode| {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("canvas"),
                 mag_filter: filter,
@@ -71,32 +82,24 @@ impl CanvasPresenter {
                 layout: &pipeline.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(canvas.view()),
-                    },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
                 ],
             })
         };
-        Self {
-            linear: bind_group(wgpu::FilterMode::Linear),
-            nearest: bind_group(wgpu::FilterMode::Nearest),
-            pipeline,
-            uniform,
-            use_nearest: false,
-        }
+        let sources = sources
+            .iter()
+            .map(|view| Source {
+                linear: bind_group(view, wgpu::FilterMode::Linear),
+                nearest: bind_group(view, wgpu::FilterMode::Nearest),
+            })
+            .collect();
+        Self { pipeline, uniform, sources, canvas_size, use_nearest: false }
     }
 
     /// Updates the view. `canvas_to_screen` maps canvas pixels to physical
     /// window pixels; `target_size` is the window size in physical pixels.
-    pub fn set_view(
-        &mut self,
-        queue: &wgpu::Queue,
-        canvas: &Canvas,
-        canvas_to_screen: Affine2,
-        target_size: Vec2,
-    ) {
+    pub fn set_view(&mut self, queue: &wgpu::Queue, canvas_to_screen: Affine2, target_size: Vec2) {
         let screen_to_clip = Mat4::from_translation(Vec3::new(-1.0, 1.0, 0.0))
             * Mat4::from_scale(Vec3::new(2.0 / target_size.x, -2.0 / target_size.y, 1.0));
         let m = canvas_to_screen.matrix2;
@@ -109,7 +112,7 @@ impl CanvasPresenter {
         ]);
         let uniform = ViewUniform {
             transform: (screen_to_clip * canvas_to_screen).to_cols_array_2d(),
-            canvas_size: [canvas.width() as f32, canvas.height() as f32],
+            canvas_size: [self.canvas_size.0 as f32, self.canvas_size.1 as f32],
             _padding: [0.0; 2],
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
@@ -117,9 +120,11 @@ impl CanvasPresenter {
         self.use_nearest = zoom >= Self::NEAREST_FROM_ZOOM;
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Draws the canvas from the source at index `source`.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, source: usize) {
+        let source = &self.sources[source];
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, if self.use_nearest { &self.nearest } else { &self.linear }, &[]);
+        pass.set_bind_group(0, if self.use_nearest { &source.nearest } else { &source.linear }, &[]);
         pass.draw(0..6, 0..1);
     }
 }

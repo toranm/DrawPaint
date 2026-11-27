@@ -1,4 +1,5 @@
-// Stamps round brush dabs into the canvas texture, one instanced quad each.
+// Stamps round brush dabs into the stroke coverage buffer, one instanced
+// quad each. The blend state accumulates coverage as c' = s + c * (1 - s).
 
 struct Canvas {
     size: vec2<f32>,
@@ -10,8 +11,7 @@ struct Instance {
     @location(0) center: vec2<f32>,
     @location(1) radius: f32,
     @location(2) hardness: f32,
-    // Premultiplied colour already scaled by the dab's flow.
-    @location(3) color: vec4<f32>,
+    @location(3) flow: f32,
 }
 
 struct VertexOutput {
@@ -20,7 +20,7 @@ struct VertexOutput {
     @location(0) offset: vec2<f32>,
     @location(1) @interpolate(flat) radius: f32,
     @location(2) @interpolate(flat) hardness: f32,
-    @location(3) @interpolate(flat) color: vec4<f32>,
+    @location(3) @interpolate(flat) flow: f32,
 }
 
 @vertex
@@ -40,7 +40,7 @@ fn vs_main(@builtin(vertex_index) index: u32, instance: Instance) -> VertexOutpu
     out.offset = offset;
     out.radius = instance.radius;
     out.hardness = instance.hardness;
-    out.color = instance.color;
+    out.flow = instance.flow;
     return out;
 }
 
@@ -52,5 +52,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let soft_width = max(in.radius * (1.0 - in.hardness), 1.0);
     let outer = in.radius + 0.5;
     let coverage = 1.0 - smoothstep(outer - soft_width, outer, distance);
-    return in.color * coverage;
+    return vec4(coverage * in.flow);
 }

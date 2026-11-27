@@ -1,105 +1,140 @@
-use crate::CANVAS_FORMAT;
+use dp_brush::Dab;
+use dp_core::{Document, LayerId, PixelStore, Rect};
+use glam::{Affine2, Vec2};
 
-/// The pixels of the document. Phase 0 has a single opaque layer.
-pub struct Canvas {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    width: u32,
-    height: u32,
+use crate::compositor::{CompositeLayer, LayerCompositor};
+use crate::pixels::LayerPixels;
+use crate::present::CanvasPresenter;
+use crate::stroke::{StrokeLayer, StrokeStyle};
+use crate::util::read_rgba8;
+
+/// Everything on the GPU that belongs to one document: its layers, the
+/// stroke in progress, the flattened image and its on-screen presentation.
+///
+/// A renderer is tied to its document's canvas size; a new or opened
+/// document gets a new renderer.
+pub struct CanvasRenderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    size: (u32, u32),
+    pixels: LayerPixels,
+    stroke: StrokeLayer,
+    compositor: LayerCompositor,
+    presenter: CanvasPresenter,
 }
 
-impl Canvas {
-    /// Largest canvas side that fits on this device.
+impl CanvasRenderer {
+    /// Largest canvas side the device can hold.
     pub fn max_side(device: &wgpu::Device) -> u32 {
         device.limits().max_texture_dimension_2d
     }
 
-    /// Creates a canvas with undefined contents; call [`Canvas::clear`] before use.
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("canvas"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: CANVAS_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { texture, view, width, height }
-    }
-
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    pub fn view(&self) -> &wgpu::TextureView {
-        &self.view
-    }
-
-    /// Fills the whole canvas with a premultiplied colour.
-    pub fn clear(&self, encoder: &mut wgpu::CommandEncoder, color: [f32; 4]) {
-        let [r, g, b, a] = color.map(f64::from);
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("canvas clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-    }
-
-    /// Copies the canvas back to the CPU as tightly packed RGBA8 rows.
-    ///
-    /// Blocks until the GPU has finished; not for use on the stroke path.
-    pub fn read_pixels(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
-        const BYTES_PER_PIXEL: u32 = 4;
-        let unpadded_row = self.width * BYTES_PER_PIXEL;
-        let padded_row = unpadded_row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("canvas readback"),
-            size: u64::from(padded_row) * u64::from(self.height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_buffer(
-            self.texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row),
-                    rows_per_image: None,
-                },
-            },
-            wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
-        );
-        queue.submit([encoder.finish()]);
-
-        let slice = buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |result| result.expect("map canvas readback buffer"));
-        device.poll(wgpu::PollType::wait_indefinitely()).expect("wait for canvas readback");
-
-        let mapped = slice.get_mapped_range().expect("canvas readback buffer is mapped");
-        let mut pixels = Vec::with_capacity((unpadded_row * self.height) as usize);
-        for row in mapped.chunks_exact(padded_row as usize) {
-            pixels.extend_from_slice(&row[..unpadded_row as usize]);
+    /// Creates the GPU state for `document`, with all its layers transparent.
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+        document: &Document,
+    ) -> Self {
+        let size = (document.width(), document.height());
+        let mut pixels = LayerPixels::new(device.clone(), queue.clone(), size);
+        for layer in document.layers() {
+            pixels.create_layer(layer.id);
         }
-        pixels
+        let compositor = LayerCompositor::new(device, size);
+        let presenter = CanvasPresenter::new(device, target_format, size, &compositor.views());
+        Self {
+            device: device.clone(),
+            queue: queue.clone(),
+            size,
+            pixels,
+            stroke: StrokeLayer::new(device, queue, size),
+            compositor,
+            presenter,
+        }
+    }
+
+    pub fn bounds(&self) -> Rect {
+        Rect::from_size(self.size.0, self.size.1)
+    }
+
+    /// The layer pixels, for undo/redo and file loading.
+    pub fn pixels(&mut self) -> &mut dyn PixelStore {
+        &mut self.pixels
+    }
+
+    /// Starts a new stroke with an empty coverage buffer.
+    pub fn begin_stroke(&mut self) {
+        self.stroke.begin();
+    }
+
+    /// Adds dabs to the stroke in progress.
+    pub fn queue_dabs(&mut self, dabs: &[Dab]) {
+        self.stroke.queue(dabs);
+    }
+
+    /// Applies the stroke in progress to `layer` permanently and returns the
+    /// pixels `rect` held before, for undo. `rect` must cover every dab of
+    /// the stroke.
+    pub fn commit_stroke(&mut self, layer: LayerId, rect: Rect, style: StrokeStyle) -> Vec<u8> {
+        let before = self.pixels.read_rect(layer, rect);
+        if let Some(target) = self.pixels.get(layer) {
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            self.stroke.render(&self.device, &self.queue, &mut encoder, &target.view, style);
+            self.stroke.commit(&mut encoder, &target.texture, rect);
+            self.queue.submit([encoder.finish()]);
+        }
+        self.stroke.begin();
+        before
+    }
+
+    /// Flattens the visible layers. `stroke` names the layer being painted
+    /// on, if any, so the stroke in progress shows in place.
+    pub fn composite(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        document: &Document,
+        stroke: Option<(LayerId, StrokeStyle)>,
+    ) {
+        if let Some((id, style)) = stroke {
+            if let Some(layer) = self.pixels.get(id) {
+                self.stroke.render(&self.device, &self.queue, encoder, &layer.view, style);
+            }
+        }
+        let layers: Vec<CompositeLayer<'_>> = document
+            .layers()
+            .iter()
+            .filter(|layer| layer.props.visible && layer.props.opacity > 0.0)
+            .filter_map(|layer| {
+                let painting = stroke.is_some_and(|(id, _)| id == layer.id);
+                let view = if painting { self.stroke.preview() } else { &self.pixels.get(layer.id)?.view };
+                Some(CompositeLayer { view, opacity: layer.props.opacity, blend: layer.props.blend })
+            })
+            .collect();
+        self.compositor.composite(&self.device, &self.queue, encoder, document.background, &layers);
+    }
+
+    /// Updates the view. `canvas_to_screen` maps canvas pixels to physical
+    /// window pixels; `target_size` is the window size in physical pixels.
+    pub fn set_view(&mut self, canvas_to_screen: Affine2, target_size: Vec2) {
+        self.presenter.set_view(&self.queue, canvas_to_screen, target_size);
+    }
+
+    /// Draws the latest composite into the window.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.presenter.draw(pass, self.compositor.result_index());
+    }
+
+    /// Reads back part of the latest composite as opaque RGBA8.
+    pub fn read_composite(&self, rect: Rect) -> Vec<u8> {
+        read_rgba8(&self.device, &self.queue, self.compositor.result_texture(), rect)
+    }
+
+    /// Composites `document` and reads the whole flattened image back.
+    pub fn flatten(&mut self, document: &Document) -> Vec<u8> {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.composite(&mut encoder, document, None);
+        self.queue.submit([encoder.finish()]);
+        self.read_composite(self.bounds())
     }
 }

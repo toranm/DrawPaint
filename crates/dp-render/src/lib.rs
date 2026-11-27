@@ -1,5 +1,5 @@
-//! GPU side of DrawPaint: the canvas texture, brush rasterization and the
-//! on-screen presentation of the canvas.
+//! GPU side of DrawPaint: layer pixels, brush rasterization, layer
+//! compositing and the on-screen presentation of the canvas.
 //!
 //! Colours are stored as sRGB-encoded RGBA8 with premultiplied alpha and are
 //! blended in that encoded space, which is what painters coming from other
@@ -7,14 +7,16 @@
 //! format: the GPU must not linearize the values.
 
 mod canvas;
-mod dabs;
+mod compositor;
+mod pixels;
 mod present;
+mod stroke;
+mod util;
 
-pub use canvas::Canvas;
-pub use dabs::DabRenderer;
-pub use present::CanvasPresenter;
+pub use canvas::CanvasRenderer;
+pub use stroke::StrokeStyle;
 
-/// Format of canvas textures.
+/// Format of layer and composite textures.
 pub const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Picks the surface format that shows canvas values unchanged.

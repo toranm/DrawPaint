@@ -1,34 +1,43 @@
-//! The egui user interface: panels around the canvas.
+//! The egui user interface: menus and panels around the canvas.
 //!
-//! This crate only describes widgets and reports what the user asked for;
-//! it never touches the GPU or the document directly.
+//! This crate only describes widgets and reports what the user asked for as
+//! [`Action`]s; it never touches the GPU or changes the document itself.
 //!
 //! UI strings are Spanish for now. Translations arrive with the i18n work
 //! planned for phase 4.
 
+mod dialogs;
+mod panels;
+
 use dp_brush::BrushParams;
+use dp_core::{Document, LayerId, LayerProps};
 use dp_input::DeviceKind;
 
-/// Everything the panels can edit.
+/// Everything the panels own and can edit directly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiState {
     pub brush: BrushParams,
+    /// Index into [`dp_brush::presets`] of the preset the brush started from.
+    pub preset: usize,
     /// Straight sRGB-encoded brush colour.
     pub color: [f32; 3],
+    /// Size fields of the "new canvas" dialog while it is open.
+    pub new_canvas: Option<[u32; 2]>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
-        Self { brush: BrushParams::default(), color: [0.1, 0.1, 0.1] }
+        Self { brush: dp_brush::presets()[0].params, preset: 0, color: [0.1, 0.1, 0.1], new_canvas: None }
     }
 }
 
-/// Read-only view information shown in the top bar.
-#[derive(Debug, Clone, Copy)]
-pub struct ViewInfo {
-    pub zoom: f32,
-    pub rotation_degrees: f32,
-    pub canvas_size: [u32; 2],
+impl UiState {
+    pub fn select_preset(&mut self, index: usize) {
+        if let Some(preset) = dp_brush::presets().get(index) {
+            self.preset = index;
+            self.brush = preset.params;
+        }
+    }
 }
 
 /// Diagnostics about the pointer, used to validate tablet support.
@@ -41,12 +50,59 @@ pub struct PointerInfo {
     pub samples_per_second: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Read-only application state the UI displays this frame.
+pub struct Frame<'a> {
+    pub document: &'a Document,
+    /// File name of the document, if it has been saved.
+    pub file_name: Option<&'a str>,
+    pub modified: bool,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub zoom: f32,
+    pub rotation_degrees: f32,
+    /// Largest canvas side the graphics device supports.
+    pub max_canvas_side: u32,
+    pub pointer: PointerInfo,
+    /// Ask whether to save the unsaved changes before they are lost.
+    pub confirm_unsaved: bool,
+    /// An error to show until dismissed.
+    pub error: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    New {
+        width: u32,
+        height: u32,
+    },
+    Open,
+    Save,
+    SaveAs,
+    Export,
+    Undo,
+    Redo,
     FitView,
     ActualSize,
     ResetRotation,
-    ClearCanvas,
+    AddLayer,
+    DeleteLayer(LayerId),
+    /// Moves a layer one step up (towards the top) or down.
+    MoveLayer {
+        id: LayerId,
+        up: bool,
+    },
+    SelectLayer(LayerId),
+    /// `finished` is false while a slider is still being dragged.
+    SetLayerProps {
+        id: LayerId,
+        props: LayerProps,
+        finished: bool,
+    },
+    /// Answers to the unsaved-changes question.
+    UnsavedSave,
+    UnsavedDiscard,
+    UnsavedCancel,
+    DismissError,
 }
 
 #[derive(Debug)]
@@ -56,92 +112,11 @@ pub struct UiOutput {
     pub actions: Vec<Action>,
 }
 
-/// Widest brush offered by the size slider, in canvas pixels.
-const MAX_BRUSH_SIZE: f32 = 500.0;
-
-pub fn show(ui: &mut egui::Ui, state: &mut UiState, view: ViewInfo, pointer: PointerInfo) -> UiOutput {
+pub fn show(ui: &mut egui::Ui, state: &mut UiState, frame: &Frame<'_>) -> UiOutput {
     let mut actions = Vec::new();
-
-    egui::Panel::top("top_bar").show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.strong("DrawPaint");
-            ui.separator();
-            if ui.button("Ajustar").on_hover_text("Ctrl+0").clicked() {
-                actions.push(Action::FitView);
-            }
-            if ui.button("100 %").on_hover_text("Ctrl+1").clicked() {
-                actions.push(Action::ActualSize);
-            }
-            if ui.button("Enderezar").clicked() {
-                actions.push(Action::ResetRotation);
-            }
-            ui.separator();
-            if ui.button("Limpiar lienzo").clicked() {
-                actions.push(Action::ClearCanvas);
-            }
-            ui.separator();
-            ui.label(format!(
-                "{} × {} px · {:.0} % · {:.0}°",
-                view.canvas_size[0],
-                view.canvas_size[1],
-                view.zoom * 100.0,
-                view.rotation_degrees
-            ));
-        });
-    });
-
-    egui::Panel::left("tools").resizable(false).default_size(220.0).show(ui, |ui| {
-        ui.add_space(4.0);
-        ui.heading("Pincel");
-        ui.horizontal(|ui| {
-            ui.label("Color");
-            ui.color_edit_button_rgb(&mut state.color);
-        });
-        let brush = &mut state.brush;
-        ui.add(
-            egui::Slider::new(&mut brush.size, 1.0..=MAX_BRUSH_SIZE)
-                .logarithmic(true)
-                .suffix(" px")
-                .text("Tamaño"),
-        );
-        ui.add(percent_slider(&mut brush.flow, "Flujo"));
-        ui.add(percent_slider(&mut brush.hardness, "Dureza"));
-        ui.add(percent_slider(&mut brush.min_size_ratio, "Tamaño mín."));
-        ui.checkbox(&mut brush.pressure_affects_size, "La presión cambia el tamaño");
-        ui.checkbox(&mut brush.pressure_affects_flow, "La presión cambia el flujo");
-
-        ui.separator();
-        ui.heading("Puntero");
-        let device = match pointer.device {
-            Some(DeviceKind::Pen) => "Lápiz",
-            Some(DeviceKind::Eraser) => "Borrador",
-            Some(DeviceKind::Touch) => "Táctil",
-            Some(DeviceKind::Mouse) => "Ratón",
-            None => "—",
-        };
-        ui.label(format!("Dispositivo: {device}"));
-        ui.label(format!("Presión: {:.3}", pointer.pressure));
-        ui.label(format!("Inclinación: {:.0}°, {:.0}°", pointer.tilt_degrees[0], pointer.tilt_degrees[1]));
-        ui.label(format!("Muestras/s: {}", pointer.samples_per_second));
-        ui.label(if pointer.native_pen_backend {
-            "Lápiz nativo: activo"
-        } else {
-            "Lápiz nativo: no disponible"
-        });
-
-        ui.separator();
-        ui.heading("Controles");
-        ui.label("Rueda: zoom");
-        ui.label("Mayús + rueda: rotar");
-        ui.label("Botón central o Espacio + arrastrar: mover");
-    });
-
+    panels::menu_bar(ui, state, frame, &mut actions);
+    panels::brush_panel(ui, state, frame);
+    panels::layer_panel(ui, frame, &mut actions);
+    dialogs::show(ui.ctx(), state, frame, &mut actions);
     UiOutput { canvas_rect: ui.available_rect_before_wrap(), actions }
-}
-
-fn percent_slider<'a>(value: &'a mut f32, label: &'a str) -> egui::Slider<'a> {
-    egui::Slider::new(value, 0.0..=1.0)
-        .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
-        .custom_parser(|s| s.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0))
-        .text(label)
 }

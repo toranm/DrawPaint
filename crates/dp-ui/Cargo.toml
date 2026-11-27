@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-egui.workspace = true
 dp-brush.workspace = true
+dp-core.workspace = true
 dp-input.workspace = true
+egui.workspace = true

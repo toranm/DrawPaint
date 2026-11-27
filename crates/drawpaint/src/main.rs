@@ -4,6 +4,7 @@
 mod app;
 mod gpu;
 mod pointer;
+mod session;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
